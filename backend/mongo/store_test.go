@@ -10,7 +10,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/bson"
+	mongodb "go.mongodb.org/mongo-driver/mongo"
+
 	"github.com/modernice/goes/aggregate"
 	"github.com/modernice/goes/backend/mongo"
 	"github.com/modernice/goes/backend/mongo/mongotest"
@@ -18,7 +22,6 @@ import (
 	"github.com/modernice/goes/codec"
 	"github.com/modernice/goes/event"
 	etest "github.com/modernice/goes/event/test"
-	"go.mongodb.org/mongo-driver/bson"
 )
 
 func TestEventStore(t *testing.T) {
@@ -93,5 +96,96 @@ func TestEventStore_Insert_versionError(t *testing.T) {
 
 	if versionError.Event != events[0] {
 		t.Errorf("VersionError should have Event %v; got %v", events[0], versionError.Event)
+	}
+}
+
+func TestEventStore_Insert_withTransactionHandler(t *testing.T) {
+	enc := etest.NewEncoder()
+	var handlerCalled int
+	handler := mongo.EventHandler(func(ctx context.Context, e ...event.Event) error {
+		handlerCalled++
+		mongoCtx, ok := ctx.(mongodb.SessionContext)
+		if !ok || mongoCtx == nil {
+			t.Errorf("not mongo session context")
+		}
+		return nil
+	})
+
+	s := mongotest.NewEventStore(
+		enc,
+		mongo.URL(os.Getenv("MONGOREPLSTORE_URL")),
+		mongo.Database(nextEventDatabase()),
+		mongo.WithTxEventHandler(handler),
+	)
+
+	if _, err := s.Connect(context.Background()); err != nil {
+		t.Fatalf("failed to connect to mongodb: %v", err)
+	}
+
+	a := aggregate.New("foo", uuid.New())
+	evt := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 1))
+	err := s.Insert(context.Background(), evt)
+	if err != nil {
+		t.Errorf("error inserting %s", err)
+	}
+
+	if handlerCalled != 1 {
+		t.Errorf("handler was not called once")
+	}
+
+	found, err := s.Find(context.Background(), evt.ID())
+	if err != nil {
+		t.Fatalf("expected store.Find not to return error; got %#v", err)
+	}
+
+	if !event.Equal(found, evt.Event()) {
+		t.Errorf("found event doesn't match inserted event\ninserted: %#v\n\nfound: %#v\n\ndiff: %s", evt, found, cmp.Diff(
+			evt, found, cmp.AllowUnexported(evt),
+		))
+	}
+}
+
+func TestEventStore_Insert_with2TransactionHandlers1Failing(t *testing.T) {
+	enc := etest.NewEncoder()
+	expectedErr := errors.New("some error in the handler")
+	var handler1Called, handler2Called int
+	handler1 := mongo.EventHandler(func(ctx context.Context, e ...event.Event) error {
+		handler1Called++
+		return nil
+	})
+	handler2 := mongo.EventHandler(func(ctx context.Context, e ...event.Event) error {
+		handler2Called++
+		return expectedErr
+	})
+	s := mongotest.NewEventStore(
+		enc,
+		mongo.URL(os.Getenv("MONGOREPLSTORE_URL")),
+		mongo.Database(nextEventDatabase()),
+		mongo.WithTxEventHandler(handler1),
+		mongo.WithTxEventHandler(handler2),
+	)
+
+	if _, err := s.Connect(context.Background()); err != nil {
+		t.Fatalf("failed to connect to mongodb: %v", err)
+	}
+
+	a := aggregate.New("foo", uuid.New())
+	evt := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 1))
+	err := s.Insert(context.Background(), evt)
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("not expected error")
+	}
+	if handler1Called != 1 {
+		t.Errorf("handler 1 was not called once")
+	}
+	if handler2Called != 1 {
+		t.Errorf("handler 2 was not called once")
+	}
+	found, err := s.Find(context.Background(), evt.ID())
+	if err == nil {
+		t.Errorf("expected store.Find not to return error; got %#v", err)
+	}
+	if found != nil {
+		t.Errorf("found event, expected nil")
 	}
 }
