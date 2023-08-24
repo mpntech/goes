@@ -10,16 +10,17 @@ import (
 	stdtime "time"
 
 	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/x/mongo/driver"
+
 	"github.com/modernice/goes/backend/mongo/indices"
 	"github.com/modernice/goes/codec"
 	"github.com/modernice/goes/event"
 	"github.com/modernice/goes/event/query/time"
 	"github.com/modernice/goes/event/query/version"
 	"github.com/modernice/goes/helper/pick"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/x/mongo/driver"
 )
 
 // EventStore is a MongoDB event store.
@@ -33,6 +34,7 @@ type EventStore struct {
 	transactions      bool
 	validateVersions  bool
 	additionalIndices []mongo.IndexModel
+	txEventHandlers   []EventHandler
 
 	client  *mongo.Client
 	db      *mongo.Database
@@ -203,6 +205,17 @@ func WithIndices(models ...mongo.IndexModel) EventStoreOption {
 	}
 }
 
+type EventHandler func(context.Context, ...event.Event) error
+
+// WithTxEventHandler returns an EventStoreOption that adds an event handler
+// that will be executed as part of the insert transaction.
+func WithTxEventHandler(th EventHandler) EventStoreOption {
+	return func(s *EventStore) {
+		s.transactions = true
+		s.txEventHandlers = append(s.txEventHandlers, th)
+	}
+}
+
 // NewEventStore returns a MongoDB event.Store.
 func NewEventStore(enc codec.Encoding, opts ...EventStoreOption) *EventStore {
 	s := EventStore{
@@ -302,6 +315,15 @@ func (s *EventStore) Insert(ctx context.Context, events ...event.Event) error {
 				}
 			}
 			return fmt.Errorf("update state: %w", err)
+		}
+
+		for _, fn := range s.txEventHandlers {
+			if handlerErr := fn(ctx, events...); handlerErr != nil {
+				if abortError := ctx.AbortTransaction(ctx); abortError != nil {
+					return fmt.Errorf("abort transaction: %w: %s", abortError, handlerErr)
+				}
+				return fmt.Errorf("tx event handler: %w", handlerErr)
+			}
 		}
 
 		if s.transactions {
