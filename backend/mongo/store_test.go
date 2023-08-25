@@ -110,7 +110,6 @@ func TestEventStore_Insert_withTransactionHandler(t *testing.T) {
 		}
 		return nil
 	})
-
 	s := mongotest.NewEventStore(
 		enc,
 		mongo.URL(os.Getenv("MONGOREPLSTORE_URL")),
