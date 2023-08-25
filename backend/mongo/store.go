@@ -173,6 +173,9 @@ func StateCollection(name string) EventStoreOption {
 // https://docs.mongodb.com/manual/core/transactions/
 func Transactions(tx bool) EventStoreOption {
 	return func(s *EventStore) {
+		if !tx && s.transactions && len(s.txEventHandlers) > 0 {
+			panic(fmt.Errorf("transactions must be enabled for transaction event handlers"))
+		}
 		s.transactions = tx
 	}
 }

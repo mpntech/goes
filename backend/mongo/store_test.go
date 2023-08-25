@@ -189,3 +189,24 @@ func TestEventStore_Insert_with2TransactionHandlers1Failing(t *testing.T) {
 		t.Errorf("found event, expected nil")
 	}
 }
+
+func TestEventStore_WithTxEventHandler_failsWithoutTransactions(t *testing.T) {
+	enc := etest.NewEncoder()
+	handler := mongo.EventHandler(func(ctx context.Context, e ...event.Event) error {
+		return nil
+	})
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("the code did not panic")
+		}
+	}()
+
+	_ = mongotest.NewEventStore(
+		enc,
+		mongo.URL(os.Getenv("MONGOREPLSTORE_URL")),
+		mongo.Database(nextEventDatabase()),
+		mongo.WithTxEventHandler(handler),
+		mongo.Transactions(false),
+	)
+}
