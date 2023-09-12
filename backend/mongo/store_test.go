@@ -13,7 +13,9 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	mongodb "go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/modernice/goes/aggregate"
 	"github.com/modernice/goes/backend/mongo"
@@ -41,13 +43,6 @@ func TestEventStore(t *testing.T) {
 			)
 		})
 	})
-}
-
-var evtDBID uint64
-
-func nextEventDatabase() string {
-	id := atomic.AddUint64(&evtDBID, 1)
-	return fmt.Sprintf("events_%d", id)
 }
 
 func TestEventStore_Insert_versionError(t *testing.T) {
@@ -99,101 +94,265 @@ func TestEventStore_Insert_versionError(t *testing.T) {
 	}
 }
 
-func TestEventStore_Insert_withTransactionHandler(t *testing.T) {
+// TestEventStore_Insert_preAndPostHooks tests the following scenario
+// Given: [0: "insert:pre", 1: "insert:pre", 2: "insert:post", 3: "insert:post"] hooks, then
+//
+// for hook 0: InsertedEvents() returns empty slice
+// for hook 1: InsertedEvents() returns events that were inserted by hook 0
+// for hook 2: InsertedEvents() returns events that were inserted by hook 0 and 1, and the "main" events
+// for hook 3: InsertedEvents() returns events that were inserted by hook 0 and 1, the "main" events, and the events inserted by hook 2
+func TestEventStore_Insert_preAndPostHooks(t *testing.T) {
 	enc := etest.NewEncoder()
-	var handlerCalled int
-	handler := mongo.EventHandler(func(ctx context.Context, e ...event.Event) error {
-		handlerCalled++
-		mongoCtx, ok := ctx.(mongodb.SessionContext)
-		if !ok || mongoCtx == nil {
-			t.Errorf("not mongo session context")
-		}
-		return nil
-	})
+
+	a := aggregate.New("foo", uuid.New())
+	expectedEvent0 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 1))
+	expectedEvent1 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 2))
+	expectedEvent2 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 3))
+	expectedEvent3 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 4))
+	expectedEvent4 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 5))
+	allEvents := []event.Event{expectedEvent0, expectedEvent1, expectedEvent2, expectedEvent3, expectedEvent4}
+
+	hookObserver0 := aHookObserver(func(ctx mongo.TransactionContext) error { return ctx.EventStore().Insert(ctx, expectedEvent0) })
+	hookObserver1 := aHookObserver(func(ctx mongo.TransactionContext) error { return ctx.EventStore().Insert(ctx, expectedEvent1) })
+	hookObserver2 := aHookObserver(func(ctx mongo.TransactionContext) error { return ctx.EventStore().Insert(ctx, expectedEvent3) })
+	hookObserver3 := aHookObserver(func(ctx mongo.TransactionContext) error { return ctx.EventStore().Insert(ctx, expectedEvent4) })
+
 	s := mongotest.NewEventStore(
 		enc,
 		mongo.URL(os.Getenv("MONGOREPLSTORE_URL")),
 		mongo.Database(nextEventDatabase()),
-		mongo.WithTxEventHandler(handler),
+		mongo.WithTransactionHook(mongo.PreInsert, hookObserver0.hook),
+		mongo.WithTransactionHook(mongo.PreInsert, hookObserver1.hook),
+		mongo.WithTransactionHook(mongo.PostInsert, hookObserver2.hook),
+		mongo.WithTransactionHook(mongo.PostInsert, hookObserver3.hook),
 	)
 
 	if _, err := s.Connect(context.Background()); err != nil {
 		t.Fatalf("failed to connect to mongodb: %v", err)
 	}
 
-	a := aggregate.New("foo", uuid.New())
-	evt := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 1))
-	err := s.Insert(context.Background(), evt)
+	err := s.Insert(context.Background(), expectedEvent2)
 	if err != nil {
 		t.Errorf("error inserting %s", err)
 	}
 
-	if handlerCalled != 1 {
-		t.Errorf("handler was not called once")
+	type testData struct {
+		name     string
+		observer *hookObserver
+		events   []event.Event
 	}
 
-	found, err := s.Find(context.Background(), evt.ID())
-	if err != nil {
-		t.Fatalf("expected store.Find not to return error; got %#v", err)
+	tests := []testData{
+		{
+			"observer0",
+			hookObserver0,
+			nil,
+		},
+		{
+			"observer1",
+			hookObserver1,
+			[]event.Event{expectedEvent0},
+		},
+		{
+			"observer2",
+			hookObserver2,
+			[]event.Event{expectedEvent0, expectedEvent1, expectedEvent2},
+		},
+		{
+			"observer3",
+			hookObserver3,
+			[]event.Event{expectedEvent0, expectedEvent1, expectedEvent2, expectedEvent3},
+		},
 	}
 
-	if !event.Equal(found, evt.Event()) {
-		t.Errorf("found event doesn't match inserted event\ninserted: %#v\n\nfound: %#v\n\ndiff: %s", evt, found, cmp.Diff(
-			evt, found, cmp.AllowUnexported(evt),
-		))
+	for _, tt := range tests {
+		if tt.observer.called != 1 {
+			t.Errorf("hook %s was not called once", tt.name)
+		}
+		if !cmp.Equal(tt.observer.insertedEvents, tt.events) {
+			t.Errorf("hook inserted events dont match expected\nhook: %#v\n\ninserted: %#v\n\ndiff: %s", tt.observer.insertedEvents, tt.events, cmp.Diff(
+				tt.observer.insertedEvents, tt.events,
+			))
+		}
+	}
+	for _, expected := range allEvents {
+		found, err := s.Find(context.Background(), expected.ID())
+		if err != nil {
+			t.Fatalf("expected store.Find not to return error; got %#v", err)
+		}
+
+		if !event.Equal(found, expected) {
+			t.Errorf("found event doesn't match inserted event\ninserted: %#v\n\nfound: %#v\n\ndiff: %s", expected, found, cmp.Diff(
+				expected, found, cmp.AllowUnexported(expected),
+			))
+		}
 	}
 }
 
-func TestEventStore_Insert_with2TransactionHandlers1Failing(t *testing.T) {
+func TestEventStore_Insert_withPreAndPostInsertHooks(t *testing.T) {
 	enc := etest.NewEncoder()
-	expectedErr := errors.New("some error in the handler")
-	var handler1Called, handler2Called int
-	handler1 := mongo.EventHandler(func(ctx context.Context, e ...event.Event) error {
-		handler1Called++
+
+	dbName := nextEventDatabase()
+	client, testCollection, err := aCollection(dbName)
+	if err != nil {
+		t.Fatalf("failed to connect to mongodb: %v", err)
+	}
+	defer client.Disconnect(context.TODO())
+
+	a := aggregate.New("foo", uuid.New())
+	expectedEvent0 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 1))
+	expectedEvent1 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 2))
+	allEvents := []event.Event{expectedEvent0, expectedEvent1}
+	expectedEntity := testEntity{Name: "Test"}
+
+	hookObserver0 := aHookObserver(func(ctx mongo.TransactionContext) error {
+		col := ctx.Session().Client().Database(dbName).Collection("someCollection")
+		result, err := col.InsertOne(ctx, expectedEntity)
+		if err != nil {
+			return err
+		}
+		id, _ := result.InsertedID.(primitive.ObjectID)
+		expectedEntity.ID = id
 		return nil
 	})
-	handler2 := mongo.EventHandler(func(ctx context.Context, e ...event.Event) error {
-		handler2Called++
-		return expectedErr
-	})
+	hookObserver1 := aHookObserver(func(ctx mongo.TransactionContext) error { return ctx.EventStore().Insert(ctx, expectedEvent1) })
+
 	s := mongotest.NewEventStore(
 		enc,
 		mongo.URL(os.Getenv("MONGOREPLSTORE_URL")),
 		mongo.Database(nextEventDatabase()),
-		mongo.WithTxEventHandler(handler1),
-		mongo.WithTxEventHandler(handler2),
+		mongo.WithTransactionHook(mongo.PreInsert, hookObserver0.hook),
+		mongo.WithTransactionHook(mongo.PostInsert, hookObserver1.hook),
 	)
 
-	if _, err := s.Connect(context.Background()); err != nil {
+	if _, err = s.Connect(context.Background()); err != nil {
 		t.Fatalf("failed to connect to mongodb: %v", err)
 	}
 
-	a := aggregate.New("foo", uuid.New())
-	evt := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 1))
-	err := s.Insert(context.Background(), evt)
-	if !errors.Is(err, expectedErr) {
-		t.Errorf("not expected error")
+	err = s.Insert(context.Background(), expectedEvent0)
+	if err != nil {
+		t.Errorf("error inserting %s", err)
 	}
-	if handler1Called != 1 {
-		t.Errorf("handler 1 was not called once")
+
+	if hookObserver0.called != 1 {
+		t.Errorf("hook 1 was not called once")
 	}
-	if handler2Called != 1 {
-		t.Errorf("handler 2 was not called once")
+	if hookObserver1.called != 1 {
+		t.Errorf("hook 2 was not called once")
 	}
-	found, err := s.Find(context.Background(), evt.ID())
-	if err == nil {
-		t.Errorf("expected store.Find not to return error; got %#v", err)
+	for _, expected := range allEvents {
+		found, err := s.Find(context.Background(), expected.ID())
+		if err != nil {
+			t.Fatalf("expected store.Find not to return error; got %#v", err)
+		}
+		if !event.Equal(found, expected) {
+			t.Errorf("found event doesn't match inserted event\ninserted: %#v\n\nfound: %#v\n\ndiff: %s", expected, found, cmp.Diff(
+				expected, found, cmp.AllowUnexported(expected),
+			))
+		}
 	}
-	if found != nil {
-		t.Errorf("found event, expected nil")
+
+	var actual testEntity
+	err = testCollection.FindOne(context.Background(), bson.M{"_id": expectedEntity.ID}).Decode(&actual)
+	if err != nil {
+		t.Errorf("expected to find entity, got err: %s", err)
+	}
+	if actual != expectedEntity {
+		t.Errorf("actual entity doesnt match the expected entity\nactual: %#v\n\nexpected: %#v\n\ndiff: %s", actual, expectedEntity, cmp.Diff(
+			actual, expectedEntity, cmp.AllowUnexported(expectedEntity),
+		))
+	}
+
+	if !cmp.Equal(hookObserver1.insertedEvents, []event.Event{expectedEvent0}) {
+		t.Errorf("hook inserted events dont match expected\nhook: %#v\n\ninserted: %#v\n\ndiff: %s", hookObserver1.insertedEvents, []event.Event{expectedEvent0}, cmp.Diff(
+			hookObserver1.insertedEvents, []event.Event{expectedEvent0},
+		))
 	}
 }
 
-func TestEventStore_WithTxEventHandler_failsWithoutTransactions(t *testing.T) {
+func TestEventStore_Insert_with2HooksLastFailing(t *testing.T) {
 	enc := etest.NewEncoder()
-	handler := mongo.EventHandler(func(ctx context.Context, e ...event.Event) error {
-		return nil
+	expectedErr := errors.New("some error in the handler")
+
+	dbName := nextEventDatabase()
+	client, testCollection, err := aCollection(dbName)
+	if err != nil {
+		t.Fatalf("failed to connect to mongodb: %v", err)
+	}
+	defer client.Disconnect(context.TODO())
+
+	a := aggregate.New("foo", uuid.New())
+	expectedEvent0 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 1))
+	expectedEvent1 := event.New[any]("foo", etest.FooEventData{}, event.Aggregate(a.AggregateID(), a.AggregateName(), 2))
+	allEvents := []event.Event{expectedEvent0, expectedEvent1}
+	expectedEntity := testEntity{Name: "Test"}
+
+	hookObserver0 := aHookObserver(func(ctx mongo.TransactionContext) error { return ctx.EventStore().Insert(ctx, expectedEvent0) })
+	hookObserver1 := aHookObserver(func(ctx mongo.TransactionContext) error {
+		col := ctx.Session().Client().Database(dbName).Collection("someCollection")
+		result, err := col.InsertOne(ctx, expectedEntity)
+		if err != nil {
+			return err
+		}
+		id, _ := result.InsertedID.(primitive.ObjectID)
+		expectedEntity.ID = id
+		return expectedErr
 	})
+
+	s := mongotest.NewEventStore(
+		enc,
+		mongo.URL(os.Getenv("MONGOREPLSTORE_URL")),
+		mongo.Database(nextEventDatabase()),
+		mongo.WithTransactionHook(mongo.PreInsert, hookObserver0.hook),
+		mongo.WithTransactionHook(mongo.PostInsert, hookObserver1.hook),
+	)
+
+	if _, err = s.Connect(context.Background()); err != nil {
+		t.Fatalf("failed to connect to mongodb: %v", err)
+	}
+
+	err = s.Insert(context.Background(), expectedEvent1)
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("not expected error: %s", err)
+	}
+
+	if hookObserver0.called != 1 {
+		t.Errorf("hook 1 was not called once")
+	}
+	if hookObserver1.called != 1 {
+		t.Errorf("hook 2 was not called once")
+	}
+
+	for _, expected := range allEvents {
+		found, err := s.Find(context.Background(), expected.ID())
+		if err == nil {
+			t.Errorf("expected store.Find to return error")
+		}
+		if found != nil {
+			t.Errorf("found event, expected nil %s", found)
+		}
+	}
+
+	var actual *testEntity
+	result := testCollection.FindOne(context.Background(), bson.M{"_id": expectedEntity.ID}) //.Decode(actual)
+	if result.Err() == nil {
+		t.Errorf("expected error to find entity, got nil")
+	}
+	if !errors.Is(result.Err(), mongodb.ErrNoDocuments) {
+		t.Errorf("expected: '%s', got err: '%s'", mongodb.ErrNoDocuments, result.Err())
+	}
+
+	if actual != nil {
+		t.Errorf("expected nil document, got: %v", actual)
+	}
+
+}
+
+func TestEventStore_WithTxHook_failsWithoutTransactionsEnabled(t *testing.T) {
+	enc := etest.NewEncoder()
+	hook := func(ctx mongo.TransactionContext) error {
+		return nil
+	}
 
 	defer func() {
 		if r := recover(); r == nil {
@@ -205,7 +364,57 @@ func TestEventStore_WithTxEventHandler_failsWithoutTransactions(t *testing.T) {
 		enc,
 		mongo.URL(os.Getenv("MONGOREPLSTORE_URL")),
 		mongo.Database(nextEventDatabase()),
-		mongo.WithTxEventHandler(handler),
+		mongo.WithTransactionHook(mongo.PostInsert, hook),
 		mongo.Transactions(false),
 	)
+}
+
+var evtDBID uint64
+
+func nextEventDatabase() string {
+	id := atomic.AddUint64(&evtDBID, 1)
+	return fmt.Sprintf("events_%d", id)
+}
+
+type hookObserver struct {
+	hook           func(hook mongo.TransactionContext) error
+	called         int
+	insertedEvents []event.Event
+}
+
+func aHookObserver(fns ...func(mongo.TransactionContext) error) *hookObserver {
+	obs := &hookObserver{}
+	hook := func(ctx mongo.TransactionContext) error {
+		obs.called++
+		obs.insertedEvents = ctx.InsertedEvents()
+		for _, fn := range fns {
+			err := fn(ctx)
+			if err != nil {
+				fmt.Println("in hook, returning error")
+				return err
+			}
+		}
+		return nil
+	}
+	obs.hook = hook
+	return obs
+}
+
+type testEntity struct {
+	ID   primitive.ObjectID `bson:"_id,omitempty"`
+	Name string             `bson:"name,omitempty"`
+}
+
+func aCollection(dbName string) (*mongodb.Client, *mongodb.Collection, error) {
+	client, err := mongodb.Connect(context.TODO(),
+		options.Client().ApplyURI(os.Getenv("MONGOREPLSTORE_URL")))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	db := client.Database(dbName)
+	db.RunCommand(context.Background(), bson.D{{"create", "someCollection"}})
+	testCollection := db.Collection("someCollection")
+
+	return client, testCollection, nil
 }
