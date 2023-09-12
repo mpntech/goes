@@ -101,7 +101,7 @@ func TestEventStore_Insert_versionError(t *testing.T) {
 // for hook 1: InsertedEvents() returns events that were inserted by hook 0
 // for hook 2: InsertedEvents() returns events that were inserted by hook 0 and 1, and the "main" events
 // for hook 3: InsertedEvents() returns events that were inserted by hook 0 and 1, the "main" events, and the events inserted by hook 2
-func TestEventStore_Insert_preAndPostHooks(t *testing.T) {
+func TestEventStore_Insert_withPreAndPostHooks(t *testing.T) {
 	enc := etest.NewEncoder()
 
 	a := aggregate.New("foo", uuid.New())
@@ -189,7 +189,7 @@ func TestEventStore_Insert_preAndPostHooks(t *testing.T) {
 	}
 }
 
-func TestEventStore_Insert_withPreAndPostInsertHooks(t *testing.T) {
+func TestEventStore_Insert_preHookInsertingIntoCollection(t *testing.T) {
 	enc := etest.NewEncoder()
 
 	dbName := nextEventDatabase()
@@ -334,7 +334,7 @@ func TestEventStore_Insert_with2HooksLastFailing(t *testing.T) {
 	}
 
 	var actual *testEntity
-	result := testCollection.FindOne(context.Background(), bson.M{"_id": expectedEntity.ID}) //.Decode(actual)
+	result := testCollection.FindOne(context.Background(), bson.M{"_id": expectedEntity.ID})
 	if result.Err() == nil {
 		t.Errorf("expected error to find entity, got nil")
 	}
@@ -390,7 +390,6 @@ func aHookObserver(fns ...func(mongo.TransactionContext) error) *hookObserver {
 		for _, fn := range fns {
 			err := fn(ctx)
 			if err != nil {
-				fmt.Println("in hook, returning error")
 				return err
 			}
 		}
